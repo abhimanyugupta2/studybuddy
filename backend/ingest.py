@@ -125,6 +125,17 @@ def ingest(pdf_path):
     return pages, repeated, build_chunks(paragraphs)
 
 
+def chunks_path_for(pdf_path):
+    return Path(pdf_path).with_suffix(".chunks.json")
+
+
+def ingest_and_save(pdf_path):
+    pages, repeated, chunks = ingest(pdf_path)
+    out_path = chunks_path_for(pdf_path)
+    out_path.write_text(json.dumps(chunks, indent=2, ensure_ascii=False), encoding="utf-8")
+    return pages, repeated, chunks, out_path
+
+
 def report(pages, repeated, chunks):
     sizes = [len(c["text"]) for c in chunks]
     print(f"Pages: {len(pages)} | Repeated lines removed: {len(repeated)} | Chunks: {len(chunks)}")
@@ -136,9 +147,6 @@ def report(pages, repeated, chunks):
 
 if __name__ == "__main__":
     pdf_path = Path(sys.argv[1] if len(sys.argv) > 1 else "data/resume.pdf")
-    pages, repeated, chunks = ingest(pdf_path)
+    pages, repeated, chunks, out_path = ingest_and_save(pdf_path)
     report(pages, repeated, chunks)
-
-    out_path = pdf_path.with_suffix(".chunks.json")
-    out_path.write_text(json.dumps(chunks, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nSaved {len(chunks)} chunks to {out_path}")

@@ -1,8 +1,9 @@
 """
 Phase 3: ask questions about a PDF, answered only from its most relevant chunks.
+Phase 4: ask across every PDF in a folder; skip the LLM when nothing matches.
 
 Pipeline:  question -> top-k chunks (retrieve.py) -> prompt with context -> LLM answer
-Run:       python ask.py data/resume.chunks.json
+Run:       python ask.py data
 """
 import json
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import requests
 
-from retrieve import load_index, search
+from retrieve import label, load_library, search
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.1:8b"
@@ -18,9 +19,8 @@ NOT_FOUND = "I couldn't find that in your notes."
 
 
 def format_context(results):
-    """Label each chunk with its pages so the model (and you) can cite them."""
-    return "\n\n".join(f"[pages {', '.join(map(str, c['pages']))}]\n{c['text']}"
-                       for _, c in results)
+    """Label each chunk with its file and pages so the model (and you) can cite them."""
+    return "\n\n".join(f"[{label(c)}]\n{c['text']}" for _, c in results)
 
 
 def answer(question, results):
@@ -49,14 +49,18 @@ def answer(question, results):
 
 
 if __name__ == "__main__":
-    chunks_path = Path(sys.argv[1] if len(sys.argv) > 1 else "data/resume.chunks.json")
-    chunks, vectors = load_index(chunks_path)
-    print(f"Loaded {len(chunks)} chunks from {chunks_path}. Ask away (empty line to quit).\n")
+    data_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
+    chunks, vectors = load_library(data_dir)
+    files = sorted({c["source"] for c in chunks})
+    print(f"Loaded {len(chunks)} chunks from {len(files)} PDFs: {', '.join(files)}")
+    print("Ask away (empty line to quit).\n")
 
     while question := input("You: ").strip():
         results = search(question, chunks, vectors)
-        sources = ", ".join(f"#{c['id']} ({score:.2f})" for score, c in results)
-        print(f"  [retrieved {sources}]")
         print("StudyBuddy: ", end="")
+        if not results:
+            print(NOT_FOUND + "\n")              # nothing relevant: don't let the LLM guess
+            continue
         answer(question, results)
-        print()
+        sources = ", ".join(f"{label(c)} ({score:.2f})" for score, c in results)
+        print(f"  Sources: {sources}\n")

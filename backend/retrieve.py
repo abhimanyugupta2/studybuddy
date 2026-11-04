@@ -1,10 +1,11 @@
 """
 Phase 3: embed chunks and find the ones that best match a question.
+Phase 4: search a whole folder of PDFs at once, and drop weak matches.
 
-Pipeline:  chunks.json -> embedding per chunk -> vectors.npy
-           question -> embedding -> cosine similarity -> top-k chunks
-Run:       python retrieve.py data/resume.chunks.json          (build the index)
-           python retrieve.py data/resume.chunks.json "query"  (search it)
+Pipeline:  PDF -> chunks.json (ingest.py) -> embedding per chunk -> vectors.npy
+           question -> embedding -> cosine similarity -> top-k chunks above MIN_SCORE
+Run:       python retrieve.py data            (ingest + index every PDF in data/)
+           python retrieve.py data "query"    (search them all)
 """
 import json
 import sys
@@ -13,12 +14,15 @@ from pathlib import Path
 import numpy as np
 import requests
 
+from ingest import chunks_path_for, ingest_and_save
+
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
 # nomic-embed-text was trained with these prefixes; using them improves matching.
 DOC_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
 TOP_K = 3
+MIN_SCORE = 0.58   # on-topic questions scored 0.60-0.75, off-topic ones ~0.54
 
 
 # ---------- Embedding ----------
@@ -51,23 +55,46 @@ def load_index(chunks_path):
     return chunks, np.load(vec_path)
 
 
+# ---------- Library: every PDF in a folder, as one big index ----------
+def load_library(data_dir):
+    """Ingest new/changed PDFs, then stack all their chunks and vectors together."""
+    all_chunks, all_vectors = [], []
+    for pdf_path in sorted(Path(data_dir).glob("*.pdf")):
+        chunks_path = chunks_path_for(pdf_path)
+        if not chunks_path.exists() or chunks_path.stat().st_mtime < pdf_path.stat().st_mtime:
+            print(f"Ingesting {pdf_path.name} ...")
+            ingest_and_save(pdf_path)
+        chunks, vectors = load_index(chunks_path)
+        for c in chunks:
+            c["source"] = pdf_path.name             # so answers can say which file
+        all_chunks += chunks
+        all_vectors.append(vectors)
+    if not all_chunks:
+        sys.exit(f"No PDFs found in {data_dir}/ - drop some in and try again.")
+    return all_chunks, np.vstack(all_vectors)
+
+
+def label(chunk):
+    return f"{chunk['source']} p{','.join(map(str, chunk['pages']))}"
+
+
 # ---------- Search ----------
-def search(question, chunks, vectors, k=TOP_K):
-    """Return the k best chunks as [(score, chunk), ...], best first."""
+def search(question, chunks, vectors, k=TOP_K, min_score=MIN_SCORE):
+    """Return up to k chunks scoring at least min_score as [(score, chunk), ...], best first."""
     query = embed([QUERY_PREFIX + question])[0]
     scores = vectors @ query
     best = np.argsort(scores)[::-1][:k]
-    return [(float(scores[i]), chunks[i]) for i in best]
+    return [(float(scores[i]), chunks[i]) for i in best if scores[i] >= min_score]
 
 
 if __name__ == "__main__":
-    chunks_path = Path(sys.argv[1] if len(sys.argv) > 1 else "data/resume.chunks.json")
+    data_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
+    chunks, vectors = load_library(data_dir)
     if len(sys.argv) > 2:
-        chunks, vectors = load_index(chunks_path)
-        for score, c in search(sys.argv[2], chunks, vectors):
-            preview = c["text"].replace("\n", " | ")[:90]
-            print(f"{score:.3f}  #{c['id']:>2} p{c['pages']}  {preview}")
+        for score, c in search(sys.argv[2], chunks, vectors, min_score=0):   # show everything
+            flag = "" if score >= MIN_SCORE else "  (below cutoff)"
+            preview = c["text"].replace("\n", " | ")[:70]
+            print(f"{score:.3f}  {label(c):<20} {preview}{flag}")
     else:
-        chunks, vectors = build_index(chunks_path)
-        print(f"Embedded {len(chunks)} chunks -> {vectors.shape[1]}-dim vectors")
-        print(f"Saved to {vectors_path(chunks_path)}")
+        files = len({c["source"] for c in chunks})
+        print(f"Library: {files} PDFs, {len(chunks)} chunks, {vectors.shape[1]}-dim vectors")
