@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StudyBuddy</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside id="sidebar">
+    <h1>📚 StudyBuddy</h1>
+    <p class="hint">Your notes, answered by a local AI.</p>
+
+    <label id="upload" class="upload">
+      <input type="file" id="file-input" accept="application/pdf,.pdf" multiple hidden>
+      <span id="upload-text">＋ Add PDF</span>
+    </label>
+
+    <h2>Library</h2>
+    <ul id="documents"><li class="empty">No PDFs yet</li></ul>
+
+    <button id="new-chat" class="secondary">New chat</button>
+  </aside>
+
+  <main>
+    <div id="messages">
+      <div class="welcome" id="welcome">
+        <h2>Ask anything about your notes</h2>
+        <p>Add a PDF on the left, then ask a question. Answers come only from your documents,
+           with the file and page they came from.</p>
+      </div>
+    </div>
+
+    <form id="ask-form">
+      <textarea id="question" rows="1" placeholder="Ask a question…  (Enter to send, Shift+Enter for a new line)"
+                autocomplete="off"></textarea>
+      <button type="submit" id="send">Send</button>
+    </form>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -18,6 +18,7 @@ from ingest import chunks_path_for, ingest_and_save
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
+EMBED_DIM = 768
 # nomic-embed-text was trained with these prefixes; using them improves matching.
 DOC_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
@@ -41,7 +42,10 @@ def vectors_path(chunks_path):
 
 def build_index(chunks_path):
     chunks = json.loads(Path(chunks_path).read_text(encoding="utf-8"))
-    vectors = embed([DOC_PREFIX + c["text"] for c in chunks])
+    if not chunks:                                   # e.g. a scanned PDF with no text layer
+        vectors = np.zeros((0, EMBED_DIM), dtype=np.float32)
+    else:
+        vectors = embed([DOC_PREFIX + c["text"] for c in chunks])
     np.save(vectors_path(chunks_path), vectors)
     return chunks, vectors
 
