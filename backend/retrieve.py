@@ -1,20 +1,25 @@
 """
 Phase 3: embed chunks and find the ones that best match a question.
 Phase 4: search a whole folder of PDFs at once, and drop weak matches.
+Phase 7: hybrid search - meaning (embeddings) + keywords (BM25), merged by rank.
 
-Pipeline:  PDF -> chunks.json (ingest.py) -> embedding per chunk -> vectors.npy
-           question -> embedding -> cosine similarity -> top-k chunks above MIN_SCORE
-Run:       python retrieve.py data            (ingest + index every PDF in data/)
+Pipeline:  document -> chunks.json (ingest.py) -> embedding per chunk -> vectors.npy
+           question -> meaning ranking + keyword ranking -> fused top-k chunks
+Run:       python retrieve.py data            (ingest + index every document in data/)
            python retrieve.py data "query"    (search them all)
 """
 import json
+import math
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import requests
 
-from ingest import chunks_path_for, ingest_and_save
+import ingest
+from ingest import SUPPORTED, chunks_path_for, ingest_and_save
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
@@ -22,8 +27,9 @@ EMBED_DIM = 768
 # nomic-embed-text was trained with these prefixes; using them improves matching.
 DOC_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
-TOP_K = 3
+TOP_K = 5          # 3 was too few: the answer chunk often ranked 4th-5th behind name matches
 MIN_SCORE = 0.58   # on-topic questions scored 0.60-0.75, off-topic ones ~0.54
+RRF_K = 60         # standard Reciprocal Rank Fusion constant: smooths out small rank differences
 
 
 # ---------- Embedding ----------
@@ -59,22 +65,29 @@ def load_index(chunks_path):
     return chunks, np.load(vec_path)
 
 
-# ---------- Library: every PDF in a folder, as one big index ----------
+# ---------- Library: every PDF/image in a folder, as one big index ----------
+def list_documents(data_dir):
+    return sorted(p for p in Path(data_dir).iterdir() if p.suffix.lower() in SUPPORTED)
+
+
 def load_library(data_dir):
-    """Ingest new/changed PDFs, then stack all their chunks and vectors together."""
+    """Ingest new/changed documents, then stack all their chunks and vectors together.
+    Documents are also re-ingested when ingest.py itself changes (a better cleaner)."""
     all_chunks, all_vectors = [], []
-    for pdf_path in sorted(Path(data_dir).glob("*.pdf")):
-        chunks_path = chunks_path_for(pdf_path)
-        if not chunks_path.exists() or chunks_path.stat().st_mtime < pdf_path.stat().st_mtime:
-            print(f"Ingesting {pdf_path.name} ...")
-            ingest_and_save(pdf_path)
+    cleaner_changed_at = Path(ingest.__file__).stat().st_mtime
+    for doc_path in list_documents(data_dir):
+        chunks_path = chunks_path_for(doc_path)
+        if (not chunks_path.exists()
+                or chunks_path.stat().st_mtime < max(doc_path.stat().st_mtime, cleaner_changed_at)):
+            print(f"Ingesting {doc_path.name} ...")
+            ingest_and_save(doc_path)
         chunks, vectors = load_index(chunks_path)
         for c in chunks:
-            c["source"] = pdf_path.name             # so answers can say which file
+            c["source"] = doc_path.name             # so answers can say which file
         all_chunks += chunks
         all_vectors.append(vectors)
     if not all_chunks:
-        sys.exit(f"No PDFs found in {data_dir}/ - drop some in and try again.")
+        sys.exit(f"No documents found in {data_dir}/ - drop some PDFs or photos in and try again.")
     return all_chunks, np.vstack(all_vectors)
 
 
@@ -82,13 +95,51 @@ def label(chunk):
     return f"{chunk['source']} p{','.join(map(str, chunk['pages']))}"
 
 
-# ---------- Search ----------
+# ---------- Keyword search (BM25) ----------
+STOPWORDS = set("""a an and are as at be by did do does for from got had has have he her his how i
+in is it its me my of on or our she so that the their them they this to was we were what when where
+which who why will with you your""".split())
+
+
+def tokenize(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS]
+
+
+def bm25_scores(question, chunks, k1=1.5, b=0.75):
+    """Classic search-engine scoring. A word found in every chunk (like the author's name on
+    every page) counts for almost nothing; a rare, specific word counts for a lot."""
+    docs = [tokenize(c["text"]) for c in chunks]
+    avg_len = sum(map(len, docs)) / len(docs)
+    df = Counter(w for d in docs for w in set(d))
+    idf = {w: math.log((len(docs) - n + 0.5) / (n + 0.5) + 1) for w, n in df.items()}
+    scores = np.zeros(len(docs), dtype=np.float32)
+    for i, d in enumerate(docs):
+        tf = Counter(d)
+        for w in set(tokenize(question)):
+            if w in tf:
+                scores[i] += idf[w] * tf[w] * (k1 + 1) / (tf[w] + k1 * (1 - b + b * len(d) / avg_len))
+    return scores
+
+
+# ---------- Hybrid search ----------
 def search(question, chunks, vectors, k=TOP_K, min_score=MIN_SCORE):
-    """Return up to k chunks scoring at least min_score as [(score, chunk), ...], best first."""
-    query = embed([QUERY_PREFIX + question])[0]
-    scores = vectors @ query
-    best = np.argsort(scores)[::-1][:k]
-    return [(float(scores[i]), chunks[i]) for i in best if scores[i] >= min_score]
+    """Return up to k chunks as [(meaning_score, chunk), ...], best first.
+
+    Meaning search (embeddings) and keyword search (BM25) each rank every chunk; the two
+    rankings are merged with Reciprocal Rank Fusion, so a chunk ranked high by either one rises.
+    If even the best meaning score is below min_score, the question is off-topic: return nothing.
+    """
+    meaning = vectors @ embed([QUERY_PREFIX + question])[0]
+    if meaning.max() < min_score:
+        return []
+    keyword = bm25_scores(question, chunks)
+    fused = np.zeros(len(chunks))
+    for scores in (meaning, keyword):
+        for rank, i in enumerate(np.argsort(scores)[::-1]):
+            fused[i] += 1 / (RRF_K + rank)
+    candidates = [i for i in np.argsort(fused)[::-1]
+                  if meaning[i] >= min_score or keyword[i] > 0]   # unrelated chunks never sneak in
+    return [(float(meaning[i]), chunks[i]) for i in candidates[:k]]
 
 
 if __name__ == "__main__":
@@ -101,4 +152,4 @@ if __name__ == "__main__":
             print(f"{score:.3f}  {label(c):<20} {preview}{flag}")
     else:
         files = len({c["source"] for c in chunks})
-        print(f"Library: {files} PDFs, {len(chunks)} chunks, {vectors.shape[1]}-dim vectors")
+        print(f"Library: {files} documents, {len(chunks)} chunks, {vectors.shape[1]}-dim vectors")

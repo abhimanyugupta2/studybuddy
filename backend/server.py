@@ -1,9 +1,9 @@
 """
 Phase 5: StudyBuddy as a web API (and Phase 6: it also serves the chat page).
 
-Endpoints:  GET    /api/documents          list PDFs in the library
-            POST   /api/documents          upload a PDF (form field "file")
-            DELETE /api/documents/{name}   remove a PDF and its index files
+Endpoints:  GET    /api/documents          list documents (PDFs, photos, scans) in the library
+            POST   /api/documents          upload a PDF or image (form field "file")
+            DELETE /api/documents/{name}   remove a document and its index files
             POST   /api/ask                {"question", "history"} -> streamed answer
 Run:        uvicorn server:app --reload     then open http://localhost:8000
 """
@@ -12,14 +12,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
+import pymupdf
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ask import NOT_FOUND, standalone_question, stream_answer
-from ingest import chunks_path_for
-from retrieve import EMBED_DIM, label, load_library, search, vectors_path
+from ingest import SUPPORTED, chunks_path_for
+from retrieve import EMBED_DIM, label, list_documents as document_files, load_library, search, vectors_path
 
 DATA_DIR = Path(__file__).parent / "data"
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
@@ -31,13 +32,24 @@ library = {"index": EMPTY}
 
 
 def reload_library():
-    """(Re)build the in-memory index from every PDF in data/."""
-    library["index"] = load_library(DATA_DIR) if any(DATA_DIR.glob("*.pdf")) else EMPTY
+    """(Re)build the in-memory index from every document in data/."""
+    library["index"] = load_library(DATA_DIR) if document_files(DATA_DIR) else EMPTY
 
 
-def remove_document_files(pdf_path):
-    for path in (pdf_path, chunks_path_for(pdf_path), vectors_path(chunks_path_for(pdf_path))):
+def remove_document_files(doc_path):
+    for path in (doc_path, chunks_path_for(doc_path), vectors_path(chunks_path_for(doc_path))):
         path.unlink(missing_ok=True)
+
+
+def is_readable(data, suffix):
+    """Let PyMuPDF try to open it - a real check, not just trusting the file name."""
+    try:
+        doc = pymupdf.open(stream=data, filetype=suffix.lstrip("."))
+        doc.load_page(0).get_pixmap(dpi=10)               # actually decode it, not just the header
+        doc.close()
+        return True
+    except Exception:
+        return False
 
 
 @asynccontextmanager
@@ -64,37 +76,38 @@ def list_documents():
 @app.post("/api/documents")
 def upload_document(file: UploadFile):
     name = Path(file.filename or "").name               # strip any folder parts
-    if not name.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported.")
+    suffix = Path(name).suffix.lower()
+    if suffix not in SUPPORTED:
+        raise HTTPException(400, f"Supported files: {', '.join(sorted(SUPPORTED))}")
     data = file.file.read(MAX_UPLOAD_MB * 1024 * 1024 + 1)
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"PDF is larger than {MAX_UPLOAD_MB} MB.")
-    if not data.startswith(b"%PDF"):
-        raise HTTPException(400, "That file doesn't look like a PDF.")
-    pdf_path = DATA_DIR / name
-    pdf_path.write_bytes(data)
+        raise HTTPException(413, f"File is larger than {MAX_UPLOAD_MB} MB.")
+    if not is_readable(data, suffix):
+        raise HTTPException(400, f"That file doesn't look like a valid {suffix} file.")
+    doc_path = DATA_DIR / name
+    doc_path.write_bytes(data)
     try:
-        reload_library()                                # ingests + embeds the new file
+        reload_library()                                # cleans, OCRs if needed, embeds
     except Exception as e:
-        remove_document_files(pdf_path)
+        remove_document_files(doc_path)
         reload_library()
-        raise HTTPException(422, f"Couldn't read that PDF: {e}")
+        raise HTTPException(422, f"Couldn't read that file: {e}")
     added = [d for d in list_documents() if d["name"] == name]
     if not added:
-        remove_document_files(pdf_path)
+        remove_document_files(doc_path)
         reload_library()
-        raise HTTPException(422, "No text found in that PDF (is it a scanned image?).")
+        raise HTTPException(422, "No readable text found in that file, even with OCR.")
     return added[0]
 
 
 @app.delete("/api/documents/{name}")
 def delete_document(name: str):
-    pdf_path = DATA_DIR / Path(name).name
-    if pdf_path.suffix.lower() != ".pdf" or not pdf_path.exists():
+    doc_path = DATA_DIR / Path(name).name
+    if doc_path.suffix.lower() not in SUPPORTED or not doc_path.exists():
         raise HTTPException(404, "No such document.")
-    remove_document_files(pdf_path)
+    remove_document_files(doc_path)
     reload_library()
-    return {"deleted": pdf_path.name}
+    return {"deleted": doc_path.name}
 
 
 # ---------- Asking ----------

@@ -1,5 +1,6 @@
 // StudyBuddy chat page: talks to the FastAPI backend in backend/server.py.
 const $ = (id) => document.getElementById(id);
+const SUPPORTED = /\.(pdf|png|jpe?g|tiff?|bmp)$/i;   // same list as ingest.SUPPORTED
 const messagesEl = $("messages");
 const questionEl = $("question");
 let history = [];          // [{role, content}], sent with each question for follow-ups
@@ -11,12 +12,12 @@ async function loadDocuments() {
   const list = $("documents");
   list.innerHTML = "";
   if (!docs.length) {
-    list.innerHTML = '<li class="empty">No PDFs yet</li>';
+    list.innerHTML = '<li class="empty">No documents yet</li>';
     return;
   }
   for (const d of docs) {
     const li = document.createElement("li");
-    li.innerHTML = `<span>📄</span><span class="name"></span><span class="meta"></span>
+    li.innerHTML = `<span>${/\.pdf$/i.test(d.name) ? "📄" : "🖼️"}</span><span class="name"></span><span class="meta"></span>
                     <button class="delete" title="Remove">×</button>`;
     li.querySelector(".name").textContent = d.name;
     li.querySelector(".name").title = d.name;
@@ -30,7 +31,7 @@ async function uploadFiles(files) {
   const label = $("upload");
   for (const file of files) {
     label.classList.add("busy");
-    $("upload-text").textContent = `Reading ${file.name}…`;
+    $("upload-text").textContent = `Reading ${file.name}… (scans take longer)`;
     const form = new FormData();
     form.append("file", file);
     const res = await fetch("/api/documents", { method: "POST", body: form });
@@ -40,7 +41,7 @@ async function uploadFiles(files) {
     }
   }
   label.classList.remove("busy");
-  $("upload-text").textContent = "＋ Add PDF";
+  $("upload-text").textContent = "＋ Add PDF or photo";
   $("file-input").value = "";
   loadDocuments();
 }
@@ -58,7 +59,7 @@ dropZone.ondragleave = () => dropZone.classList.remove("dragging");
 dropZone.ondrop = (e) => {
   e.preventDefault();
   dropZone.classList.remove("dragging");
-  uploadFiles([...e.dataTransfer.files].filter((f) => f.name.toLowerCase().endsWith(".pdf")));
+  uploadFiles([...e.dataTransfer.files].filter((f) => SUPPORTED.test(f.name)));
 };
 
 // ---------- Chat ----------
