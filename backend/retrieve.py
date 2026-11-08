@@ -27,7 +27,8 @@ EMBED_DIM = 768
 # nomic-embed-text was trained with these prefixes; using them improves matching.
 DOC_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
-TOP_K = 5          # 3 was too few: the answer chunk often ranked 4th-5th behind name matches
+CONTEXT_CHARS = 8000   # how much text the model reads per answer (~2,000 tokens). A fixed "top 5"
+                       # missed answers in short documents that would have fitted whole.
 MIN_SCORE = 0.58   # on-topic questions scored 0.60-0.75, off-topic ones ~0.54
 RRF_K = 60         # standard Reciprocal Rank Fusion constant: smooths out small rank differences
 
@@ -122,24 +123,41 @@ def bm25_scores(question, chunks, k1=1.5, b=0.75):
 
 
 # ---------- Hybrid search ----------
-def search(question, chunks, vectors, k=TOP_K, min_score=MIN_SCORE):
-    """Return up to k chunks as [(meaning_score, chunk), ...], best first.
+def search(queries, chunks, vectors, hypothetical=None, budget=CONTEXT_CHARS, min_score=MIN_SCORE,
+           gate=None):
+    """Return the best chunks as [(meaning_score, chunk), ...], best first, up to `budget`
+    characters in total - so a short document is read whole and a long one gives its best parts.
 
-    Meaning search (embeddings) and keyword search (BM25) each rank every chunk; the two
-    rankings are merged with Reciprocal Rank Fusion, so a chunk ranked high by either one rises.
-    If even the best meaning score is below min_score, the question is off-topic: return nothing.
+    `queries` are several wordings of the same question, and `hypothetical` is a made-up answer
+    written the way a document would phrase it. Asking "did he get approval?" and finding
+    "Yes, I confirm it is equivalent" needs both: the answer rarely uses the question's words.
+    Every wording ranks every chunk twice - by meaning (embeddings) and by keywords (BM25) - and
+    all the rankings are merged with Reciprocal Rank Fusion. If none of the first `gate`
+    wordings (default: all real ones) reaches min_score, the question is off-topic: nothing.
     """
-    meaning = vectors @ embed([QUERY_PREFIX + question])[0]
-    if meaning.max() < min_score:
+    queries = [queries] if isinstance(queries, str) else [q for q in queries if q.strip()]
+    if not chunks:
         return []
-    keyword = bm25_scores(question, chunks)
+    texts = [QUERY_PREFIX + q for q in queries] + ([DOC_PREFIX + hypothetical] if hypothetical else [])
+    meanings = vectors @ embed(texts).T                         # one column per wording
+    if meanings[:, :gate or len(queries)].max() < min_score:   # never gate on the made-up answer:
+        return []                                               # it can match anything
+    keywords = [bm25_scores(q, chunks) for q in queries]
     fused = np.zeros(len(chunks))
-    for scores in (meaning, keyword):
+    for scores in [*meanings.T, *keywords]:
         for rank, i in enumerate(np.argsort(scores)[::-1]):
             fused[i] += 1 / (RRF_K + rank)
-    candidates = [i for i in np.argsort(fused)[::-1]
-                  if meaning[i] >= min_score or keyword[i] > 0]   # unrelated chunks never sneak in
-    return [(float(meaning[i]), chunks[i]) for i in candidates[:k]]
+    best_meaning = meanings.max(axis=1)
+    any_keyword = np.max(keywords, axis=0)
+    results, used = [], 0
+    for i in np.argsort(fused)[::-1]:
+        if best_meaning[i] < min_score and any_keyword[i] <= 0:
+            continue                                            # unrelated chunks never sneak in
+        if results and used + len(chunks[i]["text"]) > budget:
+            break
+        results.append((float(best_meaning[i]), chunks[i]))
+        used += len(chunks[i]["text"])
+    return results
 
 
 if __name__ == "__main__":

@@ -45,6 +45,9 @@ function markdown(text) {
       html += `<li>${inline((bullet || numbered)[1])}</li>`;
     } else if (heading) {
       flushPara(); closeList(); html += `<h4>${inline(heading[1])}</h4>`;
+    } else if (/^evidence:/i.test(line)) {        // the quote an answer is based on
+      flushPara(); closeList();
+      html += `<p class="evidence">📌 ${inline(line.replace(/^evidence:\s*/i, ""))}</p>`;
     } else if (!line) {
       flushPara(); closeList();
     } else {
@@ -271,9 +274,17 @@ function renderMessage(msg) {
   return box;
 }
 
+const SHOWN_SOURCES = 4;                  // the rest fold away behind "+N more"
+
 function renderSources(sources) {
   const wrap = el("div", "sources");
-  for (const src of sources) {
+  sources.forEach((src, n) => {
+    if (n === SHOWN_SOURCES) {
+      const more = el("button", "open-page", `+${sources.length - SHOWN_SOURCES} more`);
+      more.type = "button";
+      more.onclick = () => { wrap.classList.add("all"); more.remove(); };
+      wrap.appendChild(more);
+    }
     const d = el("details");
     d.appendChild(el("summary", "", `${src.label} · ${src.score.toFixed(2)}`));
     if (src.name) {
@@ -283,8 +294,9 @@ function renderSources(sources) {
       d.appendChild(open);
     }
     d.appendChild(el("pre", "", src.text));
+    if (n >= SHOWN_SOURCES) d.classList.add("extra");
     wrap.appendChild(d);
-  }
+  });
   return wrap;
 }
 

@@ -31,9 +31,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 
-from ask import NOT_FOUND, standalone_question, stream_answer
+from ask import NOT_FOUND, find_answer_chunks, stream_answer
 from ingest import SUPPORTED, chunks_path_for
-from retrieve import EMBED_DIM, label, list_documents as document_files, load_library, search, vectors_path
+from retrieve import EMBED_DIM, label, list_documents as document_files, load_library, vectors_path
 from study import quiz_events, summary_events
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -229,12 +229,12 @@ def ask_events(question, history, documents):
         yield {"type": "token", "text": "No documents are selected. Tick at least one in the library."}
         yield {"type": "done"}
         return
-    query = standalone_question(question, history)
-    results = search(query, chunks, vectors)
+    plan, results = find_answer_chunks(question, history, chunks, vectors)
+    query = plan["question"] if history else question     # show the rewrite only for follow-ups
     sources = [{"label": label(c), "name": c["source"], "page": c["pages"][0], "score": round(s, 3),
                 "section": c.get("section"), "text": c["text"]} for s, c in results]
     yield {"type": "sources", "query": query, "sources": sources}
-    for piece in stream_answer(question, results, history) if results else [NOT_FOUND]:
+    for piece in stream_answer(question, results, history, plan["queries"][2:]) if results else [NOT_FOUND]:
         yield {"type": "token", "text": piece}
     yield {"type": "done"}
 

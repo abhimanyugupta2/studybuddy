@@ -52,8 +52,8 @@ python ask.py data
 | File | Job |
 |---|---|
 | `backend/ingest.py` | Any PDF/scan/photo → layout-aware text (headings, tables; page headers/footers dropped; OCR where there's no text layer) → chunks of ~800 characters, split at section headings |
-| `backend/retrieve.py` | Chunks → 768-number vectors (`nomic-embed-text`). Hybrid search: meaning (cosine similarity) + keywords (BM25), merged by Reciprocal Rank Fusion → top 5 chunks. Off-topic questions (best meaning score below `MIN_SCORE`) get no chunks |
-| `backend/ask.py` | Rewrites follow-ups into standalone questions, then has `llama3.1:8b` answer **only** from the retrieved chunks |
+| `backend/retrieve.py` | Chunks → 768-number vectors (`nomic-embed-text`). Hybrid search: every wording of the question is ranked by meaning (cosine similarity) and keywords (BM25), plus an imagined answer (HyDE); all rankings merged by Reciprocal Rank Fusion → the best chunks up to ~8,000 characters. Off-topic questions (score below `MIN_SCORE`) get no chunks |
+| `backend/ask.py` | Peeks at the documents, then plans the search: a standalone question, 2 rephrasings in the documents' own words and an imagined answer. `llama3.1:8b` answers **only** from the retrieved chunks and quotes its evidence |
 | `backend/study.py` | One-click summaries (map-reduce for long documents) and verified quizzes |
 | `backend/server.py` | FastAPI: documents, page images with highlights, streamed answers/summaries/quizzes (stoppable), saved chats, the web page |
 | `frontend/` | The chat page (plain HTML, CSS and JavaScript) |
