@@ -19,17 +19,32 @@ OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.1:8b"
 NOT_FOUND = "I couldn't find that in your notes."
 HISTORY_TURNS = 6          # last 3 questions + 3 answers are sent along with each question
+NUM_CTX = 8192             # Ollama's default window is smaller; summaries and quizzes need room
 
 
-def chat(messages, stream=False):
-    """Send messages to the LLM. Yields text pieces if stream=True, else returns the full reply."""
+def chat(messages, stream=False, format=None, temperature=0.2):
+    """Send messages to the LLM. Yields text pieces if stream=True, else returns the full reply.
+    format can be "json" or a JSON schema, to force structured output."""
     payload = {"model": CHAT_MODEL, "messages": messages, "stream": stream,
-               "options": {"temperature": 0.2}}
+               "options": {"temperature": temperature, "num_ctx": NUM_CTX}}
+    if format:
+        payload["format"] = format
     response = requests.post(OLLAMA_CHAT_URL, json=payload, stream=stream)
     response.raise_for_status()
     if not stream:
         return response.json()["message"]["content"]
-    return (json.loads(line)["message"]["content"] for line in response.iter_lines() if line)
+    return stream_pieces(response)
+
+
+def stream_pieces(response):
+    """Yield text as it arrives. Closing this generator closes the connection, which makes
+    Ollama stop generating - that's how the Stop button really stops the model."""
+    try:
+        for line in response.iter_lines():
+            if line:
+                yield json.loads(line)["message"]["content"]
+    finally:
+        response.close()
 
 
 def standalone_question(question, history):

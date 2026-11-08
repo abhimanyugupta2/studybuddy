@@ -30,6 +30,15 @@ Open http://localhost:8000, add documents with **＋ Add PDF or photo** (or drag
 ask away. Supported: `.pdf .png .jpg .jpeg .tif .tiff .bmp`. Scans and photos are read with OCR.
 Follow-up questions like "explain that more simply" use the conversation so far.
 
+**Features**
+- ☑️ **Choose documents:** tick the ones to search; your choice is remembered.
+- ⏹️ **Stop:** the Send button becomes Stop while an answer is written (with a live timer); stopping also stops the model.
+- 📝 **One-click summaries:** the 📝 button on a document. Long documents are summarised part by part; summaries are saved.
+- 💾 **Saved chats:** every chat is saved on your computer and listed in the sidebar.
+- 📖 **Document viewer:** "Open page" on any source shows that page with the passage highlighted.
+- 🧠 **Quiz mode:** multiple-choice questions from the ticked documents. Each question is double-checked by
+  having the model answer it from the source, and unclear ones are replaced.
+
 ## Run in the terminal instead
 
 Put PDFs or photos in `backend/data/`, then:
@@ -45,8 +54,9 @@ python ask.py data
 | `backend/ingest.py` | Any PDF/scan/photo → layout-aware text (headings, tables; page headers/footers dropped; OCR where there's no text layer) → chunks of ~800 characters, split at section headings |
 | `backend/retrieve.py` | Chunks → 768-number vectors (`nomic-embed-text`). Hybrid search: meaning (cosine similarity) + keywords (BM25), merged by Reciprocal Rank Fusion → top 5 chunks. Off-topic questions (best meaning score below `MIN_SCORE`) get no chunks |
 | `backend/ask.py` | Rewrites follow-ups into standalone questions, then has `llama3.1:8b` answer **only** from the retrieved chunks |
-| `backend/server.py` | FastAPI: upload/list/delete documents, stream answers, serve the web page |
+| `backend/study.py` | One-click summaries (map-reduce for long documents) and verified quizzes |
+| `backend/server.py` | FastAPI: documents, page images with highlights, streamed answers/summaries/quizzes (stoppable), saved chats, the web page |
 | `frontend/` | The chat page (plain HTML, CSS and JavaScript) |
 
-Your documents live in `backend/data/` and their index files in `backend/data/.index/`; neither is
-committed to git. Documents are re-processed automatically when they change or when `ingest.py` changes.
+Your documents live in `backend/data/`, their index files and summaries in `backend/data/.index/`, and
+saved chats in `backend/data/.chats/`; none of it is committed to git. Documents are re-processed automatically when they change or when `ingest.py` changes.

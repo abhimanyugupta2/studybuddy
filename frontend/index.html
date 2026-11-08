@@ -4,40 +4,70 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>StudyBuddy</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <aside id="sidebar">
-    <h1>📚 StudyBuddy</h1>
-    <p class="hint">Your notes, answered by a local AI.</p>
+    <div class="brand">
+      <h1>📚 StudyBuddy</h1>
+      <button id="menu-close" class="icon only-mobile" title="Close menu">×</button>
+    </div>
 
     <label id="upload" class="upload">
       <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp" multiple hidden>
       <span id="upload-text">＋ Add PDF or photo</span>
     </label>
 
-    <h2>Library</h2>
-    <ul id="documents"><li class="empty">No documents yet</li></ul>
+    <div class="section-head">
+      <h2>Library</h2>
+      <button id="toggle-all" class="link">Select all</button>
+    </div>
+    <ul id="documents" class="list"><li class="empty">No documents yet</li></ul>
 
-    <button id="new-chat" class="secondary">New chat</button>
+    <div class="section-head">
+      <h2>Chats</h2>
+      <button id="new-chat" class="link">＋ New chat</button>
+    </div>
+    <ul id="chats" class="list"><li class="empty">No saved chats yet</li></ul>
   </aside>
 
   <main>
-    <div id="messages">
-      <div class="welcome" id="welcome">
-        <h2>Ask anything about your notes</h2>
-        <p>Add a PDF, a scan or a photo of your notes on the left, then ask a question.
-           Answers come only from your documents, with the file and page they came from.</p>
+    <header id="topbar">
+      <button id="menu-open" class="icon only-mobile" title="Library and chats">☰</button>
+      <span id="scope">Loading…</span>
+      <div class="quiz-controls">
+        <select id="quiz-count" title="Number of questions">
+          <option value="3">3 Qs</option>
+          <option value="5" selected>5 Qs</option>
+          <option value="10">10 Qs</option>
+        </select>
+        <button id="quiz-btn" class="secondary">🧠 Quiz me</button>
       </div>
-    </div>
+    </header>
+
+    <div id="messages"></div>
 
     <form id="ask-form">
-      <textarea id="question" rows="1" placeholder="Ask a question…  (Enter to send, Shift+Enter for a new line)"
-                autocomplete="off"></textarea>
+      <textarea id="question" rows="1" autocomplete="off"
+                placeholder="Ask about your notes…  (Enter to send, Shift+Enter for a new line)"></textarea>
       <button type="submit" id="send">Send</button>
     </form>
   </main>
 
+  <aside id="viewer" hidden>
+    <header>
+      <span id="viewer-title"></span>
+      <button id="viewer-prev" class="icon" title="Previous page">‹</button>
+      <span id="viewer-page"></span>
+      <button id="viewer-next" class="icon" title="Next page">›</button>
+      <a id="viewer-newtab" target="_blank" rel="noopener" title="Open the original in a new tab">↗</a>
+      <button id="viewer-close" class="icon" title="Close viewer">×</button>
+    </header>
+    <div id="viewer-body"></div>
+  </aside>
+
+  <div id="backdrop"></div>
   <script src="app.js"></script>
 </body>
 </html>
