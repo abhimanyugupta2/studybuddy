@@ -31,6 +31,10 @@ ask away. Supported: `.pdf .png .jpg .jpeg .tif .tiff .bmp`. Scans and photos ar
 Follow-up questions like "explain that more simply" use the conversation so far.
 
 **Features**
+- 🖥️ **Terminal look:** green-on-black hacker theme with a live activity log showing each real step
+  (query rewrites, chunks retrieved, generation).
+- 🔀 **Parallel sessions:** start a question, then switch to another session or a new one; answers keep
+  running in the background and are saved when done (● = working, ✓ = finished while you were away).
 - ☑️ **Choose documents:** tick the ones to search; your choice is remembered.
 - ⏹️ **Stop:** the Send button becomes Stop while an answer is written (with a live timer); stopping also stops the model.
 - 📝 **One-click summaries:** the 📝 button on a document. Long documents are summarised part by part; summaries are saved.

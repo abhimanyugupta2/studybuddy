@@ -18,6 +18,7 @@ Every streamed endpoint sends newline-delimited JSON events. If the browser disc
 """
 import json
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -25,15 +26,16 @@ from pathlib import Path
 
 import numpy as np
 import pymupdf
+import requests
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 
-from ask import NOT_FOUND, find_answer_chunks, stream_answer
+from ask import NOT_FOUND, chat, find_answer_chunks, stream_answer
 from ingest import SUPPORTED, chunks_path_for
-from retrieve import EMBED_DIM, label, list_documents as document_files, load_library, vectors_path
+from retrieve import EMBED_DIM, embed, label, list_documents as document_files, load_library, vectors_path
 from study import quiz_events, summary_events
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -114,6 +116,15 @@ def safely(events):
         yield {"type": "error", "message": str(e)}
 
 
+def warm_up_models():
+    """Load both models into memory now, so the first question doesn't wait ~20s for them."""
+    try:
+        embed(["warm up"])
+        chat([{"role": "user", "content": "Say OK"}])
+    except Exception:
+        pass                                            # Ollama not running yet: nothing to warm
+
+
 @asynccontextmanager
 async def lifespan(app):
     DATA_DIR.mkdir(exist_ok=True)
@@ -121,10 +132,21 @@ async def lifespan(app):
     for leftover in CHATS_DIR.glob("*.tmp"):            # from a save interrupted by a crash
         leftover.unlink(missing_ok=True)
     reload_library()
+    threading.Thread(target=warm_up_models, daemon=True).start()
     yield
 
 
 app = FastAPI(title="StudyBuddy", lifespan=lifespan)
+
+
+# ---------- Health (the page's status line) ----------
+@app.get("/api/health")
+def health():
+    try:
+        tags = requests.get("http://localhost:11434/api/tags", timeout=2).json()
+        return {"ollama": True, "models": [m["name"] for m in tags.get("models", [])]}
+    except (requests.RequestException, ValueError):
+        return {"ollama": False, "models": []}
 
 
 # ---------- Documents ----------
@@ -229,7 +251,12 @@ def ask_events(question, history, documents):
         yield {"type": "token", "text": "No documents are selected. Tick at least one in the library."}
         yield {"type": "done"}
         return
+    docs = len({c["source"] for c in chunks})
+    yield {"type": "log", "text": f"index loaded: {len(chunks)} chunks across {docs} document(s)"}
+    yield {"type": "log", "text": "expanding query: rewrite + synonyms + imagined answer (HyDE)"}
     plan, results = find_answer_chunks(question, history, chunks, vectors)
+    # the real search plan, shown live in the page's activity log
+    yield {"type": "plan", "queries": plan["queries"][1:], "hypothetical": plan["hypothetical"]}
     query = plan["question"] if history else question     # show the rewrite only for follow-ups
     sources = [{"label": label(c), "name": c["source"], "page": c["pages"][0], "score": round(s, 3),
                 "section": c.get("section"), "text": c["text"]} for s, c in results]

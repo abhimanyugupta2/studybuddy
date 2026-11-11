@@ -24,6 +24,9 @@ from ingest import SUPPORTED, chunks_path_for, ingest_and_save
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
 EMBED_DIM = 768
+# Ollama unloads a model after 5 idle minutes by default. Reloading both models while two
+# sessions compete for them took over a minute; keeping them loaded makes that ~instant.
+KEEP_ALIVE = "30m"
 # nomic-embed-text was trained with these prefixes; using them improves matching.
 DOC_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
@@ -36,7 +39,8 @@ RRF_K = 60         # standard Reciprocal Rank Fusion constant: smooths out small
 # ---------- Embedding ----------
 def embed(texts):
     """Return an (n, dim) array of unit-length vectors, one per text."""
-    response = requests.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "input": texts})
+    response = requests.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "input": texts,
+                                                     "keep_alive": KEEP_ALIVE})
     response.raise_for_status()
     vectors = np.array(response.json()["embeddings"], dtype=np.float32)
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)   # so dot product = cosine

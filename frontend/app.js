@@ -1,15 +1,22 @@
-// StudyBuddy chat page: talks to the FastAPI backend in backend/server.py.
+// StudyBuddy terminal: talks to the FastAPI backend in backend/server.py.
+//
+// Every chat (a "session") runs on its own: you can ask in one, switch to another or start a
+// new one while the first keeps answering in the background. Each session has its own
+// messages and its own running request; the page only draws the session you're looking at.
 const $ = (id) => document.getElementById(id);
 const SUPPORTED = /\.(pdf|png|jpe?g|tiff?|bmp)$/i;   // same list as ingest.SUPPORTED
+const SHOWN_SOURCES = 4;                              // the rest fold away behind "+N more"
+const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 const messagesEl = $("messages");
 const questionEl = $("question");
 
 const state = {
   docs: [],              // [{name, pages, chunks}]
   selected: new Set(),   // ticked document names
-  chatId: null,
-  messages: [],          // the open chat; see renderMessage() for the shape
-  controller: null,      // AbortController of the running request (null = idle)
+  sessions: new Map(),   // id -> {id, messages, controller}; controller != null while answering
+  active: null,          // the session on screen
+  unseen: new Set(),     // sessions that finished in the background
+  health: null,
 };
 
 // ---------- Small helpers ----------
@@ -26,8 +33,20 @@ const el = (tag, cls, text) => {
   return e;
 };
 const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isRunning = (s) => !!s?.controller;
+const anyRunning = () => [...state.sessions.values()].some(isRunning);
 
-// A tiny, safe Markdown renderer: paragraphs, bullet/numbered lists, headings, **bold**, `code`.
+let toastTimer;
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+}
+
+// A tiny, safe Markdown renderer: paragraphs, lists, headings, **bold**, `code`, Evidence lines.
 function markdown(text) {
   const inline = (s) => escapeHtml(s)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
@@ -47,7 +66,7 @@ function markdown(text) {
       flushPara(); closeList(); html += `<h4>${inline(heading[1])}</h4>`;
     } else if (/^evidence:/i.test(line)) {        // the quote an answer is based on
       flushPara(); closeList();
-      html += `<p class="evidence">📌 ${inline(line.replace(/^evidence:\s*/i, ""))}</p>`;
+      html += `<p class="evidence">${inline(line.replace(/^evidence:\s*/i, ""))}</p>`;
     } else if (!line) {
       flushPara(); closeList();
     } else {
@@ -83,6 +102,102 @@ async function streamEvents(url, body, onEvent, signal) {
   }
 }
 
+// ---------- Matrix rain (background) ----------
+const matrix = { speed: 1 };
+(function startMatrix() {
+  const canvas = $("matrix"), ctx = canvas.getContext("2d");
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const glyphs = "アイウエオカキクケコサシスセソタチツテトナニヌネノ0123456789ABCDEF<>/{}[]$#";
+  const size = 16;
+  let drops = [];
+  const resize = () => {
+    canvas.width = innerWidth; canvas.height = innerHeight;
+    drops = Array.from({ length: Math.ceil(innerWidth / size) }, () => Math.random() * -50);
+  };
+  resize();
+  addEventListener("resize", resize);
+  let last = 0;
+  const frame = (t) => {
+    requestAnimationFrame(frame);
+    if (document.hidden || t - last < 55 / matrix.speed) return;
+    last = t;
+    ctx.fillStyle = "rgba(4, 7, 10, 0.12)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = `${size}px monospace`;
+    drops.forEach((y, i) => {
+      ctx.fillStyle = Math.random() > 0.975 ? "#d9ffe9" : "#33ff99";
+      ctx.fillText(glyphs[(Math.random() * glyphs.length) | 0], i * size, y * size);
+      drops[i] = y * size > canvas.height && Math.random() > 0.975 ? 0 : y + 1;
+    });
+  };
+  requestAnimationFrame(frame);
+})();
+// the rain speeds up while any session is working
+setInterval(() => { matrix.speed = anyRunning() ? 2.6 : 1; }, 400);
+
+// ---------- Health line ----------
+async function checkHealth() {
+  try { state.health = await (await fetch("/api/health")).json(); } catch { state.health = { ollama: false, models: [] }; }
+  const line = $("sysline");
+  if (state.health.ollama) {
+    const model = state.health.models.find((m) => m.startsWith("llama")) || state.health.models[0] || "?";
+    line.textContent = `● llm link: online · ${model}`;
+    line.className = "sysline online";
+  } else {
+    line.textContent = "✕ llm link: OFFLINE · start Ollama";
+    line.className = "sysline offline";
+  }
+}
+setInterval(checkHealth, 30000);
+
+// ---------- Boot sequence (once per browser session) ----------
+async function boot() {
+  let shown = false;
+  try { shown = sessionStorage.getItem("booted"); sessionStorage.setItem("booted", "1"); } catch { /* ignore */ }
+  if (shown || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const screen = $("boot"), log = $("boot-log");
+  screen.hidden = false;
+  let skip = false;
+  const stop = () => { skip = true; };
+  addEventListener("keydown", stop, { once: true });
+  screen.addEventListener("click", stop, { once: true });
+
+  const chunks = state.docs.reduce((n, d) => n + d.chunks, 0);
+  const model = state.health?.models.find((m) => m.startsWith("llama")) || "llama3.1:8b";
+  const sessions = (await fetch("/api/chats").then((r) => r.json()).catch(() => [])).length;
+  const lines = [
+    ["big", "STUDYBUDDY OS v2.0"],
+    ["dim", "local study intelligence · nothing leaves this machine"],
+    ["", ""],
+    [state.docs.length ? "ok" : "fail", `[ ${state.docs.length ? " OK " : "WARN"} ] mounting /data ................ ${state.docs.length} document(s)`],
+    ["ok", `[  OK  ] loading vector index ........ ${chunks} chunks · 768-dim`],
+    ["ok", "[  OK  ] search engine ............... BM25 + embeddings + HyDE"],
+    [state.health?.ollama ? "ok" : "fail",
+     state.health?.ollama ? `[  OK  ] llm link .................... ${model} @ localhost:11434`
+                          : "[ FAIL ] llm link .................... ollama offline"],
+    ["ok", `[  OK  ] sessions restored ........... ${sessions}`],
+    ["", ""],
+    ["big", "> access granted. welcome back, operator."],
+  ];
+  for (const [cls, text] of lines) {
+    const span = el("span", cls);
+    log.appendChild(span);
+    for (let i = 0; i < text.length && !skip; i += 3) {   // 3 characters per frame: ~2.5s in all
+      span.textContent = text.slice(0, i + 3);
+      await sleep(8);
+    }
+    span.textContent = text;
+    log.appendChild(document.createTextNode("\n"));
+    if (!skip) await sleep(70);
+  }
+  if (!skip) await sleep(400);
+  screen.classList.add("fade");
+  await sleep(350);
+  screen.hidden = true;
+  removeEventListener("keydown", stop);
+  questionEl.focus();
+}
+
 // ---------- Library (with tick boxes) ----------
 async function loadDocuments() {
   state.docs = await (await fetch("/api/documents")).json();
@@ -106,33 +221,33 @@ function saveSelection() {
 function renderDocuments() {
   const list = $("documents");
   list.innerHTML = "";
-  if (!state.docs.length) list.innerHTML = '<li class="empty">No documents yet. Add one above.</li>';
+  if (!state.docs.length) list.innerHTML = '<li class="empty">no documents yet. upload one above</li>';
   for (const d of state.docs) {
     const li = el("li", state.selected.has(d.name) ? "" : "off");
     const box = el("input");
     box.type = "checkbox";
     box.checked = state.selected.has(d.name);
     box.title = "Use this document when answering";
+    box.setAttribute("aria-label", `Use ${d.name}`);
     box.onchange = () => {
       box.checked ? state.selected.add(d.name) : state.selected.delete(d.name);
       saveSelection();
       renderDocuments();
     };
-    const name = el("span", "name", `${/\.pdf$/i.test(d.name) ? "📄" : "🖼️"} ${d.name}`);
+    const name = el("span", "name", d.name);
     name.title = d.name;
-    name.style.cursor = "pointer";
     name.onclick = () => { box.checked = !box.checked; box.onchange(); };
     const actions = el("span", "actions");
     actions.append(
-      iconButton("📝", "One-click summary", () => summarize(d.name)),
-      iconButton("📖", "Open document", () => openViewer(d.name, 1)),
-      iconButton("×", "Remove from library", () => deleteDocument(d.name), "delete"),
+      iconButton("sum", "One-click summary", () => summarize(d.name)),
+      iconButton("view", "Open document", () => openViewer(d.name, 1)),
+      iconButton("x", "Remove from library", () => deleteDocument(d.name), "delete"),
     );
     li.append(box, name, el("span", "meta", `${d.pages}p`), actions);
     list.appendChild(li);
   }
   const all = state.docs.length && state.selected.size === state.docs.length;
-  $("toggle-all").textContent = all ? "Select none" : "Select all";
+  $("toggle-all").textContent = all ? "[none]" : "[all]";
   updateScope();
 }
 
@@ -148,10 +263,10 @@ function updateScope() {
   const n = state.selected.size, total = state.docs.length;
   const scope = $("scope");
   scope.classList.toggle("warn", total > 0 && n === 0);
-  scope.textContent = !total ? "Add a document to get started"
-    : n === 0 ? "No documents ticked. Tick at least one in the library"
-    : n === total ? (total === 1 ? "Searching 1 document" : `Searching all ${total} documents`)
-    : `Searching ${n} of ${total}: ${[...state.selected].join(", ")}`;
+  if (!total) scope.textContent = "> no documents mounted. upload one to begin";
+  else if (n === 0) scope.textContent = "> no documents ticked. tick at least one in // LIBRARY";
+  else scope.innerHTML = `> search scope: <b>${n}/${total}</b> document${total > 1 ? "s" : ""}` +
+    (n < total ? ` · ${escapeHtml([...state.selected].join(", "))}` : "");
 }
 
 $("toggle-all").onclick = () => {
@@ -164,17 +279,20 @@ async function uploadFiles(files) {
   const label = $("upload");
   for (const file of files) {
     label.classList.add("busy");
-    $("upload-text").textContent = `Reading ${file.name}… (scans take longer)`;
+    $("upload-text").textContent = `[ ingesting ${file.name}… ]`;
     const form = new FormData();
     form.append("file", file);
     const res = await fetch("/api/documents", { method: "POST", body: form });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(`Couldn't add ${file.name}: ${err.detail || res.statusText}`);
+      toast(`couldn't add ${file.name}: ${err.detail || res.statusText}`);
+    } else {
+      const d = await res.json();
+      toast(`mounted ${d.name} · ${d.pages} page(s) · ${d.chunks} chunks`);
     }
   }
   label.classList.remove("busy");
-  $("upload-text").textContent = "＋ Add PDF or photo";
+  $("upload-text").textContent = "[ + UPLOAD PDF / IMAGE ]";
   $("file-input").value = "";
   loadDocuments();
 }
@@ -220,7 +338,7 @@ function openViewer(name, page = 1, highlight = "") {
 
 function showViewerPage() {
   const { name, page, pages, highlight, highlightPage } = viewerState;
-  $("viewer-page").textContent = `${page} / ${pages}`;
+  $("viewer-page").textContent = `${page}/${pages}`;
   $("viewer-prev").disabled = page <= 1;
   $("viewer-next").disabled = page >= pages;
   const hl = page === highlightPage && highlight ? `?hl=${encodeURIComponent(highlight.slice(0, 1500))}` : "";
@@ -242,39 +360,65 @@ $("viewer-close").onclick = closeViewer;
 
 // ---------- Rendering messages ----------
 // A message: {role: "user"|"assistant", content, kind?: "answer"|"summary"|"quiz"|"command"|"quiz-cmd",
-//             title?, sources?, query?, seconds?, stopped?, error?, quiz?: {questions, picks}}
+//             title?, sources?, query?, log?, seconds?, stopped?, error?, quiz?: {questions, picks}}
+// While a task runs it also has a transient `status` (never saved).
+const elements = new Map();              // message object -> its element, for the session on screen
+
 function renderMessage(msg) {
   const box = el("div", `msg ${msg.role}`);
   if (msg.role === "user") {
     if (msg.kind === "command" || msg.kind === "quiz-cmd") box.classList.add("command");
-    box.textContent = msg.content;
+    box.appendChild(el("span", "ps", msg.kind === "command" || msg.kind === "quiz-cmd" ? "$" : "root@studybuddy:~$"));
+    box.appendChild(document.createTextNode(msg.content));
     return box;
   }
   if (msg.error) box.classList.add("error");
-  if (msg.kind === "summary" || msg.kind === "quiz") box.classList.add("wide");
+  if (msg.status && msg.content) box.classList.add("writing");
+  box.appendChild(el("div", "who", msg.kind === "summary" ? "[studybuddy::summary]"
+    : msg.kind === "quiz" ? "[studybuddy::quiz]" : "[studybuddy]"));
   if (msg.title) box.appendChild(el("div", "title", msg.title));
+  if (msg.log?.length) box.appendChild(renderLog(msg));
 
   const body = el("div", "body");
-  if (msg.status) body.appendChild(el("span", "status", msg.status));
-  else if (msg.content) body.innerHTML = markdown(msg.content);
+  if (msg.content) body.innerHTML = markdown(msg.content);
+  if (msg.status && !msg.content) {
+    const s = el("div", "status");
+    s.append(el("span", "spin", SPINNER[0]), document.createTextNode(msg.status));
+    body.appendChild(s);
+  }
   box.appendChild(body);
 
   if (msg.kind === "quiz" && msg.quiz?.questions.length) box.appendChild(renderQuiz(msg));
-
   if (msg.query && msg.query.trim().toLowerCase() !== (msg.question || "").trim().toLowerCase()) {
-    box.appendChild(el("div", "meta-row", `Searched for: “${msg.query}”`));
+    box.appendChild(el("div", "meta-row", `searched for: “${msg.query}”`));
   }
   if (msg.sources?.length) box.appendChild(renderSources(msg.sources));
 
   const meta = el("div", "meta-row");
-  if (msg.seconds !== undefined) meta.appendChild(el("span", "", `⏱ ${msg.seconds}s`));
-  if (msg.cached) meta.appendChild(el("span", "tag", "saved summary"));
-  if (msg.stopped) meta.appendChild(el("span", "tag stopped", "stopped"));
+  if (msg.seconds !== undefined) meta.appendChild(el("span", "", `t=${msg.seconds}s`));
+  if (msg.cached) meta.appendChild(el("span", "tag-chip", "cached summary"));
+  if (msg.stopped) meta.appendChild(el("span", "tag-chip stopped", "stopped"));
   if (meta.childElementCount) box.appendChild(meta);
   return box;
 }
 
-const SHOWN_SOURCES = 4;                  // the rest fold away behind "+N more"
+function renderLog(msg) {
+  const d = el("details", "log");
+  d.open = !!msg.status;                         // open while working, folded when done
+  d.appendChild(el("summary", "", `▸ activity log · ${msg.log.length} lines`));
+  for (const entry of msg.log) {
+    const line = el("div", `line ${entry.kind}`);
+    const tag = { info: "[*]", ok: "[+]", warn: "[!]", err: "[x]" }[entry.kind] || "[*]";
+    line.append(el("span", "t", `${entry.t.toFixed(1).padStart(5, " ")}s `), el("span", "tag", tag + " "));
+    if (entry.quote) {
+      line.append(document.createTextNode(entry.text + " "), el("span", "quote", `“${entry.quote}”`));
+    } else {
+      line.append(document.createTextNode(entry.text));
+    }
+    d.appendChild(line);
+  }
+  return d;
+}
 
 function renderSources(sources) {
   const wrap = el("div", "sources");
@@ -286,9 +430,9 @@ function renderSources(sources) {
       wrap.appendChild(more);
     }
     const d = el("details");
-    d.appendChild(el("summary", "", `${src.label} · ${src.score.toFixed(2)}`));
+    d.appendChild(el("summary", "", `src ${src.label} · ${src.score.toFixed(2)}`));
     if (src.name) {
-      const open = el("button", "open-page", `📖 Open page ${src.page}`);
+      const open = el("button", "open-page", `» open page ${src.page}`);
       open.type = "button";
       open.onclick = () => openViewer(src.name, src.page, src.text);
       d.appendChild(open);
@@ -306,18 +450,24 @@ function renderQuiz(msg) {
   const answered = picks.filter((p) => p !== null && p !== undefined).length;
   const right = questions.filter((q, i) => picks[i] === q.answer).length;
   const done = answered === questions.length;
-  wrap.appendChild(el("div", "score",
-    done ? `Final score: ${right} / ${questions.length} ${right === questions.length ? "🎉" : ""}`
-         : `Score: ${right} / ${answered} answered (${questions.length} questions)`));
+  const bar = "█".repeat(right) + "▓".repeat(answered - right) + "░".repeat(questions.length - answered);
+  const score = el("div", "scorebar");
+  score.append(el("span", "bar", bar),
+    el("span", "", done ? `FINAL ${right}/${questions.length}${right === questions.length ? " · flawless" : ""}`
+                        : `score ${right}/${answered} · ${questions.length - answered} left`));
+  wrap.appendChild(score);
 
   questions.forEach((q, i) => {
     const card = el("div", "q");
-    card.appendChild(el("div", "qtext", `${i + 1}. ${q.question}`));
+    const qt = el("div", "qtext");
+    qt.append(el("span", "n", `Q${i + 1} › `), document.createTextNode(q.question));
+    card.appendChild(qt);
     const opts = el("div", "options");
     const pick = picks[i];
     q.options.forEach((option, j) => {
-      const b = el("button", "option", `${"ABCD"[j]}. ${option}`);
+      const b = el("button", "option");
       b.type = "button";
+      b.append(el("span", "k", `[${"ABCD"[j]}]`), document.createTextNode(option));
       if (pick !== null && pick !== undefined) {
         b.disabled = true;
         if (j === q.answer) b.classList.add("correct");
@@ -326,15 +476,17 @@ function renderQuiz(msg) {
         b.onclick = () => {
           picks[i] = j;
           refresh(msg);
-          saveChat();
+          saveSession(sessionOf(msg));
         };
       }
       opts.appendChild(b);
     });
     card.appendChild(opts);
     if (pick !== null && pick !== undefined) {
-      const ex = el("div", "explain", `${pick === q.answer ? "✅ Correct." : "❌ Not quite."} ${q.explanation} `);
-      const open = el("button", "open-page", `📖 ${q.source.label}`);
+      const ex = el("div", "explain");
+      ex.append(el("span", `verdict ${pick === q.answer ? "good" : "bad"}`, pick === q.answer ? "ACCESS GRANTED · " : "ACCESS DENIED · "),
+        document.createTextNode(`${q.explanation} `));
+      const open = el("button", "open-page", `» ${q.source.label}`);
       open.type = "button";
       open.onclick = () => openViewer(q.source.name, q.source.page, q.source.text || "");
       ex.appendChild(open);
@@ -343,7 +495,7 @@ function renderQuiz(msg) {
     wrap.appendChild(card);
   });
   if (done) {
-    const again = el("button", "secondary", "🧠 New quiz");
+    const again = el("button", "btn", "[ NEW QUIZ ]");
     again.type = "button";
     again.onclick = startQuiz;
     wrap.appendChild(again);
@@ -351,24 +503,35 @@ function renderQuiz(msg) {
   return wrap;
 }
 
-const elements = new Map();                 // message object -> its element on the page
+function sessionOf(msg) {
+  for (const s of state.sessions.values()) if (s.messages.includes(msg)) return s;
+  return state.active;
+}
 
-function addMessage(msg, save = true) {
-  $("welcome")?.remove();
-  state.messages.push(msg);
-  const node = renderMessage(msg);
-  elements.set(msg, node);
-  messagesEl.appendChild(node);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-  if (save) saveChat();
+function addMessage(session, msg) {
+  session.messages.push(msg);
+  if (session === state.active) {
+    $("welcome")?.remove();
+    const node = renderMessage(msg);
+    node.classList.add("fresh");                   // fade in once
+    elements.set(msg, node);
+    messagesEl.appendChild(node);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
   return msg;
 }
 
+// Redraw one message - only if it belongs to the session on screen (background work just
+// updates the message object; it's drawn when you switch back).
 function refresh(msg) {
   const old = elements.get(msg);
-  const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+  if (!old) return;
+  const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 90;
+  const logWasOpen = old.querySelector(".log")?.open;
   const node = renderMessage(msg);
-  old?.replaceWith(node);
+  const log = node.querySelector(".log");
+  if (log && logWasOpen !== undefined && msg.status) log.open = logWasOpen;   // respect a manual fold
+  old.replaceWith(node);
   elements.set(msg, node);
   if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -376,8 +539,9 @@ function refresh(msg) {
 function renderAll() {
   messagesEl.innerHTML = "";
   elements.clear();
-  if (!state.messages.length) return showWelcome();
-  for (const msg of state.messages) {
+  const session = state.active;
+  if (!session.messages.length) return showWelcome();
+  for (const msg of session.messages) {
     const node = renderMessage(msg);
     elements.set(msg, node);
     messagesEl.appendChild(node);
@@ -385,98 +549,152 @@ function renderAll() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+const ASCII = [
+  " ____  _             _       ____            _     _",
+  "/ ___|| |_ _   _  __| |_   _| __ ) _   _  __| | __| |_   _",
+  "\\___ \\| __| | | |/ _` | | | |  _ \\| | | |/ _` |/ _` | | | |",
+  " ___) | |_| |_| | (_| | |_| | |_) | |_| | (_| | (_| | |_| |",
+  "|____/ \\__|\\__,_|\\__,_|\\__, |____/ \\__,_|\\__,_|\\__,_|\\__, |",
+  "                       |___/                         |___/",
+].join("\n");
+
 function showWelcome() {
   const w = el("div", "welcome");
   w.id = "welcome";
-  w.innerHTML = `
-    <h2>Ask anything about your notes</h2>
-    <p>Answers come only from the documents you tick, with the file and page they came from.</p>
-    <div class="tips">
-      <div class="tip">☑️ <b>Tick</b> documents in the library to choose what gets searched.</div>
-      <div class="tip">📝 Hover a document for a <b>one-click summary</b> or to <b>open</b> it.</div>
-      <div class="tip">🧠 <b>Quiz me</b> (top right) tests you on the ticked documents.</div>
-      <div class="tip">📖 Every answer lists its sources. <b>Open page</b> jumps straight there.</div>
-    </div>`;
+  w.appendChild(el("pre", "ascii", ASCII));
+  w.appendChild(el("p", "", "> answers come only from the documents you tick, with the file and page they came from."));
+  const cmds = el("div", "cmds");
+  for (const [k, v] of [
+    ["[x] tick", "choose which documents get searched in // LIBRARY"],
+    ["sum / view", "one-click summary, or open a document"],
+    ["[ QUIZ ME ]", "get tested on the ticked documents"],
+    ["[+ new]", "start another session, even while one is still answering"],
+  ]) {
+    const c = el("div", "cmd");
+    c.append(el("b", "", k), el("span", "", v));
+    cmds.appendChild(c);
+  }
+  w.appendChild(cmds);
+  if (state.docs.length) {
+    const tryBox = el("div", "try");
+    for (const q of ["what are the main topics?", "summarise the key dates", "what should I remember most?"]) {
+      const b = el("button", "", `$ ${q}`);
+      b.type = "button";
+      b.onclick = () => ask(state.active, q);
+      tryBox.appendChild(b);
+    }
+    w.appendChild(tryBox);
+  }
   messagesEl.appendChild(w);
 }
 
-// ---------- Running a streamed task with a Stop button and a timer ----------
-async function runTask(msg, url, body, onEvent) {
+// ---------- Running a streamed task, per session ----------
+async function runTask(session, msg, url, body, onEvent) {
   const controller = new AbortController();
-  state.controller = controller;
-  setSendButton(true);
+  session.controller = controller;
+  state.unseen.delete(session.id);
+  updateControls();
+  renderSessions();
   const started = performance.now();
-  const baseStatus = msg.status;
-  const tick = setInterval(() => {
-    if (!msg.status) return;
-    const secs = Math.round((performance.now() - started) / 1000);
-    msg.status = `${msg.statusText || baseStatus} ${secs}s`;
+  const secs = () => (performance.now() - started) / 1000;
+  msg.log = msg.log || [];
+  const log = (kind, text, quote) => { msg.log.push({ t: secs(), kind, text, ...(quote ? { quote } : {}) }); refresh(msg); };
+  let frame = 0;
+  const tick = setInterval(() => {          // spinner + seconds, drawn only if on screen
     const s = elements.get(msg)?.querySelector(".status");
-    if (s) s.textContent = msg.status;
-  }, 500);
+    if (!s) return;
+    s.firstChild.textContent = SPINNER[frame++ % SPINNER.length];
+    s.lastChild.textContent = ` ${msg.status} ${secs().toFixed(0)}s`;
+  }, 90);
   try {
-    await streamEvents(url, body, onEvent, controller.signal);
+    await streamEvents(url, body, (event) => onEvent(event, log), controller.signal);
+    log("ok", `done in ${secs().toFixed(1)}s`);
   } catch (err) {
     if (err.name === "AbortError") {
       msg.stopped = true;
+      log("warn", "stopped by operator");
       if (!msg.content && msg.kind !== "quiz") msg.content = "Stopped before an answer was written.";
     } else {
       msg.error = true;
-      msg.content = `Something went wrong: ${err.message}\n\nIs Ollama running?`;
+      log("err", `error: ${err.message}`);
+      msg.content = `[x] ${err.message}\n\nIs Ollama running?`;
     }
   } finally {
     clearInterval(tick);
     delete msg.status;
-    delete msg.statusText;
-    msg.seconds = Math.round((performance.now() - started) / 1000);
-    state.controller = null;
-    setSendButton(false);
+    msg.seconds = Math.round(secs());
+    session.controller = null;
+    if (session !== state.active) {
+      state.unseen.add(session.id);
+      toast(`session "${titleOf(session)}" finished`);
+    }
     refresh(msg);
-    questionEl.focus();
-    await saveChat();                      // finish saving before the chat list re-reads it
-    loadChats();
+    updateControls();
+    await saveSession(session);            // finish saving before the list re-reads it
+    renderSessions();
   }
 }
 
-function setSendButton(busy) {
+function updateControls() {
+  const busy = isRunning(state.active);
   const b = $("send");
-  b.textContent = busy ? "■ Stop" : "Send";
+  b.textContent = busy ? "[ ■ STOP ]" : "[ RUN ]";
   b.classList.toggle("stop", busy);
-  b.title = busy ? "Stop this answer" : "";
+  b.title = busy ? "Stop this answer (other sessions keep running)" : "";
   $("quiz-btn").disabled = busy;
 }
 
-const isBusy = () => state.controller !== null;
+function canStart(session) {
+  if (isRunning(session)) {
+    toast("this session is busy. press [+ new] to work in parallel");
+    return false;
+  }
+  return true;
+}
 
-function needsDocuments() {
+function needsDocuments(session) {
   if (state.selected.size) return false;
-  addMessage({ role: "assistant", kind: "answer", content: "No documents are ticked. Tick at least one in the library first." }, false);
+  addMessage(session, { role: "assistant", kind: "answer", content: "[x] no documents ticked. tick at least one in // LIBRARY first." });
   return true;
 }
 
 // ---------- Asking ----------
-function apiHistory() {
+function apiHistory(session) {
   // what the model sees as the conversation: questions, answers and summaries (not quizzes)
-  return state.messages
+  return session.messages
     .filter((m) => !["quiz", "quiz-cmd"].includes(m.kind) && !m.error && m.content)
     .map((m) => ({ role: m.role, content: m.content }))
     .slice(-12);
 }
 
-async function ask(question) {
-  if (isBusy() || needsDocuments()) return;
-  const history = apiHistory();
-  addMessage({ role: "user", content: question });
-  const msg = addMessage({ role: "assistant", kind: "answer", question, content: "", status: "Searching your notes…" }, false);
-  await runTask(msg, "/api/ask", { question, history, documents: [...state.selected] }, (event) => {
-    if (event.type === "sources") {
+async function ask(session, question) {
+  if (!canStart(session) || needsDocuments(session)) return;
+  const history = apiHistory(session);
+  addMessage(session, { role: "user", content: question });
+  saveSession(session);
+  const msg = addMessage(session, { role: "assistant", kind: "answer", question, content: "", log: [], status: "planning search" });
+  let wrote = false;
+  await runTask(session, msg, "/api/ask", { question, history, documents: [...state.selected] }, (event, log) => {
+    if (event.type === "log") {
+      log("info", event.text);
+    } else if (event.type === "plan") {
+      for (const q of event.queries.slice(1, 4)) log("ok", "rephrased:", q);
+      if (event.hypothetical) log("ok", "imagined answer:", event.hypothetical.slice(0, 140));
+      msg.status = "ranking chunks";
+      refresh(msg);
+    } else if (event.type === "sources") {
       msg.sources = event.sources;
       msg.query = event.query;
-      msg.statusText = "Writing answer…";
-      msg.status = msg.statusText;
+      if (event.sources.length) {
+        const best = event.sources.reduce((a, b) => (b.score > a.score ? b : a));
+        log("ok", `retrieved ${event.sources.length} chunks · best ${best.score.toFixed(2)} (${best.label})`);
+      } else {
+        log("warn", "no chunk above threshold: off-topic for these documents");
+      }
+      msg.status = "generating answer";
       refresh(msg);
     } else if (event.type === "token") {
-      delete msg.status;
+      if (!wrote) { wrote = true; log("info", "streaming answer from llama3.1:8b"); }
       msg.content += event.text;
       refresh(msg);
     }
@@ -485,138 +703,167 @@ async function ask(question) {
 
 // ---------- One-click summary ----------
 async function summarize(name) {
-  if (isBusy()) return;
   document.body.classList.remove("menu-open");
-  addMessage({ role: "user", kind: "command", content: `📝 Summarise ${name}` });
-  const msg = addMessage({ role: "assistant", kind: "summary", title: `Summary · ${name}`, content: "",
-                           status: "Reading the document…" }, false);
-  await runTask(msg, `/api/documents/${encodeURIComponent(name)}/summary`, {}, (event) => {
+  const session = state.active;
+  if (!canStart(session)) return;
+  addMessage(session, { role: "user", kind: "command", content: `summarize "${name}"` });
+  saveSession(session);
+  const msg = addMessage(session, { role: "assistant", kind: "summary", title: name, content: "", log: [], status: "reading the document" });
+  await runTask(session, msg, `/api/documents/${encodeURIComponent(name)}/summary`, {}, (event, log) => {
     if (event.type === "progress") {
-      msg.statusText = event.text;
-      msg.status = event.text;
+      log("info", event.text.replace(/…$/, ""));
+      msg.status = event.text.replace(/…$/, "").toLowerCase();
       refresh(msg);
     } else if (event.type === "token") {
-      delete msg.status;
+      if (!msg.content) log("info", "writing summary");
       msg.content += event.text;
       refresh(msg);
     } else if (event.type === "done" && event.cached) {
       msg.cached = true;
+      log("ok", "loaded saved summary from cache");
     }
   });
 }
 
 // ---------- Quiz mode ----------
 async function startQuiz() {
-  if (isBusy() || needsDocuments()) return;
+  const session = state.active;
+  if (!canStart(session) || needsDocuments(session)) return;
   const count = Number($("quiz-count").value);
   const scope = state.selected.size === state.docs.length ? "all documents" : [...state.selected].join(", ");
-  addMessage({ role: "user", kind: "quiz-cmd", content: `🧠 Quiz me: ${count} questions from ${scope}` });
-  const msg = addMessage({ role: "assistant", kind: "quiz", title: "Quiz", content: "",
-                           quiz: { questions: [], picks: [] }, status: "Picking passages…" }, false);
-  await runTask(msg, "/api/quiz", { documents: [...state.selected], count }, (event) => {
+  addMessage(session, { role: "user", kind: "quiz-cmd", content: `quiz --questions ${count} --from "${scope}"` });
+  saveSession(session);
+  const msg = addMessage(session, { role: "assistant", kind: "quiz", content: "",
+                                    quiz: { questions: [], picks: [] }, log: [], status: "picking passages" });
+  await runTask(session, msg, "/api/quiz", { documents: [...state.selected], count }, (event, log) => {
     if (event.type === "progress") {
-      msg.statusText = event.text;
-      msg.status = event.text;
+      log("info", event.text.replace(/…$/, ""));
+      msg.status = event.text.replace(/…$/, "").toLowerCase();
       refresh(msg);
     } else if (event.type === "quiz") {
       msg.quiz = { questions: event.questions, picks: event.questions.map(() => null) };
-      const dropped = event.dropped ? ` (${event.dropped} unclear question${event.dropped > 1 ? "s were" : " was"} left out after double-checking.)` : "";
+      log("ok", `${event.questions.length} questions verified` + (event.dropped ? ` · ${event.dropped} unclear ones replaced or dropped` : ""));
       msg.content = event.questions.length
-        ? `Pick an answer for each question. You'll see right away if it's correct.${dropped}`
-        : "I couldn't write questions I was sure about from these documents. Try again or tick different ones.";
+        ? "Pick an answer for each question. Each one was double-checked against its source."
+        : "[x] couldn't write questions I was sure about from these documents. Try again or tick different ones.";
     }
   });
 }
 $("quiz-btn").onclick = startQuiz;
 
-// ---------- Saved chats ----------
-async function loadChats() {
-  const chats = await (await fetch("/api/chats")).json();
+// ---------- Sessions (saved chats) ----------
+function titleOf(session) {
+  const first = session.messages.find((m) => m.role === "user");
+  return (first?.content || "new session").slice(0, 60);
+}
+
+let sessionList = [];
+async function renderSessions() {
+  try { sessionList = await (await fetch("/api/chats")).json(); } catch { /* keep the last list */ }
   const list = $("chats");
   list.innerHTML = "";
-  if (!chats.length) list.innerHTML = '<li class="empty">No saved chats yet</li>';
-  for (const c of chats) {
-    const li = el("li", c.id === state.chatId ? "active" : "");
-    const name = el("span", "name", `💬 ${c.title}`);
-    name.title = `${c.title}\n${new Date(c.updated * 1000).toLocaleString()}`;
+  const ids = new Set(sessionList.map((c) => c.id));
+  // a brand-new session that's still saving its first message, or running, shows too
+  const local = [...state.sessions.values()].filter((s) => !ids.has(s.id) && (s.messages.length || isRunning(s)))
+    .map((s) => ({ id: s.id, title: titleOf(s), updated: Date.now() / 1000 }));
+  const all = [...local, ...sessionList];
+  if (!all.length) list.innerHTML = '<li class="empty">no saved sessions</li>';
+  for (const c of all) {
+    const running = isRunning(state.sessions.get(c.id));
+    const li = el("li", [c.id === state.active?.id ? "active" : "", running ? "running" : "",
+                         state.unseen.has(c.id) ? "done-unseen" : ""].join(" "));
+    const name = el("span", "name", c.title);
+    name.title = `${c.title}\n${new Date(c.updated * 1000).toLocaleString()}${running ? "\n(working…)" : ""}`;
     const actions = el("span", "actions");
-    actions.appendChild(iconButton("×", "Delete chat", () => deleteChat(c.id), "delete"));
+    actions.appendChild(iconButton("x", "Delete session", () => deleteSession(c.id), "delete"));
     li.append(name, actions);
-    li.onclick = () => openChat(c.id);
+    li.onclick = () => openSession(c.id);
     list.appendChild(li);
   }
 }
 
-async function saveChat() {
-  if (!state.messages.length) return;
-  const first = state.messages.find((m) => m.role === "user");
-  const title = (first?.content || "Chat").replace(/^[📝🧠]\s*/u, "").slice(0, 60);
+async function saveSession(session) {
+  if (!session?.messages.length || session.deleted) return;   // never resurrect a deleted session
   // transient UI fields (status) are never saved
-  const messages = state.messages.map(({ status, statusText, ...m }) => m);
-  const body = JSON.stringify({ title, messages });
-  const id = state.chatId;               // fixed now, in case another chat is opened meanwhile
-  // saves run one after another, so an older save can never overwrite a newer one
-  saveQueue = saveQueue.then(() => fetch(`/api/chats/${id}`, {
+  const messages = session.messages.map(({ status, ...m }) => m);
+  const body = JSON.stringify({ title: titleOf(session), messages });
+  // saves of one session run one after another, so an older save never overwrites a newer one
+  session.saving = (session.saving || Promise.resolve()).then(() => fetch(`/api/chats/${session.id}`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body,
   })).catch(() => {});
-  return saveQueue;
+  return session.saving;
 }
-let saveQueue = Promise.resolve();
 
-async function openChat(id) {
-  if (isBusy()) return;
-  const res = await fetch(`/api/chats/${id}`);
-  if (!res.ok) return newChat();
-  state.chatId = id;
-  state.messages = (await res.json()).messages;
+async function openSession(id) {
+  let session = state.sessions.get(id);
+  if (!session) {                          // not in memory yet: load it from disk
+    const res = await fetch(`/api/chats/${id}`);
+    if (!res.ok) return newSession();
+    session = { id, messages: (await res.json()).messages, controller: null };
+    state.sessions.set(id, session);
+  }
+  state.active = session;
+  state.unseen.delete(id);
   store.set("chatId", id);
   renderAll();
-  loadChats();
-  document.body.classList.remove("menu-open");
-}
-
-function newChat() {
-  if (isBusy()) return;
-  state.chatId = newId();
-  state.messages = [];
-  store.set("chatId", state.chatId);
-  renderAll();
-  loadChats();
+  updateControls();
+  renderSessions();
   document.body.classList.remove("menu-open");
   questionEl.focus();
 }
 
-async function deleteChat(id) {
-  if (!confirm("Delete this chat?")) return;
-  await fetch(`/api/chats/${id}`, { method: "DELETE" });
-  if (id === state.chatId) newChat();
-  else loadChats();
+function newSession() {
+  const session = { id: newId(), messages: [], controller: null };
+  state.sessions.set(session.id, session);
+  state.active = session;
+  store.set("chatId", session.id);
+  renderAll();
+  updateControls();
+  renderSessions();
+  document.body.classList.remove("menu-open");
+  questionEl.focus();
 }
-$("new-chat").onclick = newChat;
 
-// ---------- Input box ----------
+async function deleteSession(id) {
+  const session = state.sessions.get(id);
+  if (!confirm(isRunning(session) ? "This session is still working. Stop it and delete?" : "Delete this session?")) return;
+  if (session) session.deleted = true;
+  session?.controller?.abort();
+  state.sessions.delete(id);
+  await fetch(`/api/chats/${id}`, { method: "DELETE" });
+  if (id === state.active?.id) newSession();
+  else renderSessions();
+}
+$("new-chat").onclick = newSession;
+
+// ---------- Prompt ----------
 $("ask-form").onsubmit = (e) => {
   e.preventDefault();
-  if (isBusy()) {                          // the button is "Stop" while busy
-    state.controller.abort();
+  const session = state.active;
+  if (isRunning(session)) {                // the button is STOP while this session works
+    session.controller.abort();
     return;
   }
   const question = questionEl.value.trim();
   if (!question) return;
   questionEl.value = "";
   questionEl.style.height = "auto";
-  ask(question);
+  ask(session, question);
 };
 questionEl.onkeydown = (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    if (!isBusy()) $("ask-form").requestSubmit();
+    if (isRunning(state.active)) toast("this session is busy. press [+ new] to work in parallel");
+    else $("ask-form").requestSubmit();
   }
 };
 questionEl.oninput = () => {             // grow the box with the text
   questionEl.style.height = "auto";
   questionEl.style.height = questionEl.scrollHeight + "px";
 };
+addEventListener("beforeunload", (e) => {
+  if (anyRunning()) e.preventDefault();  // leaving would cut off answers still being written
+});
 
 // ---------- Mobile menu ----------
 $("menu-open").onclick = () => document.body.classList.add("menu-open");
@@ -625,9 +872,9 @@ $("backdrop").onclick = () => document.body.classList.remove("menu-open");
 
 // ---------- Start ----------
 (async () => {
-  await loadDocuments();
+  await Promise.all([loadDocuments(), checkHealth()]);
   const last = store.get("chatId", null);
-  if (last) await openChat(last);
-  else newChat();
-  loadChats();
+  if (last) await openSession(last);
+  else newSession();
+  boot();
 })();

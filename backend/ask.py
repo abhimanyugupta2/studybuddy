@@ -13,7 +13,7 @@ from pathlib import Path
 
 import requests
 
-from retrieve import label, load_library, search
+from retrieve import KEEP_ALIVE, label, load_library, search
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.1:8b"
@@ -25,7 +25,7 @@ NUM_CTX = 8192             # Ollama's default window is smaller; summaries and q
 def chat(messages, stream=False, format=None, temperature=0.2):
     """Send messages to the LLM. Yields text pieces if stream=True, else returns the full reply.
     format can be "json" or a JSON schema, to force structured output."""
-    payload = {"model": CHAT_MODEL, "messages": messages, "stream": stream,
+    payload = {"model": CHAT_MODEL, "messages": messages, "stream": stream, "keep_alive": KEEP_ALIVE,
                "options": {"temperature": temperature, "num_ctx": NUM_CTX}}
     if format:
         payload["format"] = format
