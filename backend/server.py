@@ -256,7 +256,8 @@ def ask_events(question, history, documents):
     yield {"type": "log", "text": "expanding query: rewrite + synonyms + imagined answer (HyDE)"}
     plan, results = find_answer_chunks(question, history, chunks, vectors)
     # the real search plan, shown live in the page's activity log
-    yield {"type": "plan", "queries": plan["queries"][1:], "hypothetical": plan["hypothetical"]}
+    yield {"type": "plan", "queries": plan["queries"][1:], "hypothetical": plan["hypothetical"],
+           "about_documents": plan["about_documents"], "overview": plan["overview"]}
     query = plan["question"] if history else question     # show the rewrite only for follow-ups
     sources = [{"label": label(c), "name": c["source"], "page": c["pages"][0], "score": round(s, 3),
                 "section": c.get("section"), "text": c["text"]} for s, c in results]

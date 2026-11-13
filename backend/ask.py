@@ -13,7 +13,7 @@ from pathlib import Path
 
 import requests
 
-from retrieve import KEEP_ALIVE, label, load_library, search
+from retrieve import KEEP_ALIVE, label, load_library, overview, search
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.1:8b"
@@ -53,8 +53,10 @@ SEARCH_PLAN_SCHEMA = {
         "question": {"type": "string"},
         "rephrasings": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
         "hypothetical_answer": {"type": "string"},
+        "about_documents": {"type": "boolean"},
+        "overview": {"type": "boolean"},
     },
-    "required": ["question", "rephrasings", "hypothetical_answer"],
+    "required": ["question", "rephrasings", "hypothetical_answer", "about_documents", "overview"],
 }
 
 
@@ -79,7 +81,13 @@ def plan_search(question, history=(), snippets=()):
         "the question, the conversation or the snippets. Don't change what is being asked.\n"
         "- 'hypothetical_answer': 1-2 sentences written the way the source document itself would "
         "state the answer, using the snippets' names and wording. Only this one may guess "
-        "details; it is used only to search.\n\n"
+        "details; it is used only to search.\n"
+        "- 'about_documents': true if the question could be answered from the student's documents, "
+        "including general requests like 'summarise this', 'key points', 'what should I remember', "
+        "'what is the deadline'. false ONLY if it is clearly about something else (general "
+        "knowledge, sports, cooking, small talk, other subjects).\n"
+        "- 'overview': true if it asks about the documents as a whole (summary, main points, key "
+        "takeaways, what to remember) rather than one specific fact.\n\n"
         + (f"Snippets from the user's documents that may be relevant:\n{peek}\n\n" if peek else "")
         + (f"Conversation so far:\n{convo}\n\n" if convo else "")
         + f"Question: {question}"
@@ -90,18 +98,32 @@ def plan_search(question, history=(), snippets=()):
         rewritten = plan["question"].strip() or question
         return {"question": rewritten,
                 "queries": [question, rewritten, *[r for r in plan["rephrasings"] if r.strip()]],
-                "hypothetical": plan["hypothetical_answer"].strip() or None}
+                "hypothetical": plan["hypothetical_answer"].strip() or None,
+                "about_documents": plan["about_documents"] is True,
+                "overview": plan["overview"] is True}
     except (ValueError, KeyError, TypeError, AttributeError):
-        return {"question": question, "queries": [question], "hypothetical": None}
+        return {"question": question, "queries": [question], "hypothetical": None,
+                "about_documents": False, "overview": False}
 
 
 def find_answer_chunks(question, history, chunks, vectors):
-    """The whole search: peek -> plan -> search. Returns (plan, results)."""
+    """The whole search: peek -> plan -> search. Returns (plan, results).
+
+    Off-topic check: a question goes ahead if the model judged it to be about the documents
+    OR its wording scores above MIN_SCORE. A fixed score alone failed: on one assignment PDF
+    "what is the deadline?" scored 0.55 and general questions like "what should I remember
+    most?" never mention anything specific, so they were all refused."""
     peek = search([question], chunks, vectors, budget=900, min_score=0)
     plan = plan_search(question, history, [c["text"] for _, c in peek])
-    # Only the user's own question (and its spelling-fixed standalone rewrite) decide
-    # "off-topic or not": rephrasings written after peeking at the documents always sound on-topic.
-    results = search(plan["queries"], chunks, vectors, hypothetical=plan["hypothetical"], gate=2)
+    if plan["about_documents"] and plan["overview"]:
+        results = overview(plan["question"], chunks, vectors)      # read across the whole thing
+    elif plan["about_documents"]:
+        results = search(plan["queries"], chunks, vectors, hypothetical=plan["hypothetical"],
+                         min_score=0)                              # judged relevant: no score gate
+    else:
+        # Only the user's own wording decides here: rephrasings written after peeking at the
+        # documents always sound on-topic.
+        results = search(plan["queries"], chunks, vectors, hypothetical=plan["hypothetical"], gate=2)
     return plan, results
 
 
@@ -130,6 +152,9 @@ def stream_answer(question, results, history=(), rephrasings=()):
         "- First find the exact sentence(s) in the context that answer the question. Give a "
         "clear answer in 1-3 full sentences (say who, what and when where it helps), then on a "
         "new line write 'Evidence:' followed by that sentence in quotes.\n"
+        "- For general requests about the documents (summary, main points, what to remember), "
+        "answer from the whole context as short bullet points, and quote the single most "
+        "important sentence as the evidence.\n"
         f"- If no sentence in the context answers it, reply exactly: \"{NOT_FOUND}\""
         f"{hint}\n\nContext:\n{format_context(results)}"
     )

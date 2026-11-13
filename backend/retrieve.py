@@ -164,6 +164,23 @@ def search(queries, chunks, vectors, hypothetical=None, budget=CONTEXT_CHARS, mi
     return results
 
 
+def overview(question, chunks, vectors, budget=CONTEXT_CHARS):
+    """For "summarise / key points / what should I remember": chunks spread evenly across the
+    documents, in reading order, instead of the few that best match the (vague) wording.
+    Short documents are read whole. Scores are still shown so you can see what was used."""
+    meaning = vectors @ embed([QUERY_PREFIX + question])[0]
+    order = sorted(range(len(chunks)), key=lambda i: (chunks[i]["source"], chunks[i]["id"]))
+    total = sum(len(chunks[i]["text"]) for i in order)
+    step = max(1, math.ceil(total / budget))                   # take every step-th chunk
+    picked, used = [], 0
+    for i in order[::step]:
+        if picked and used + len(chunks[i]["text"]) > budget:
+            break
+        picked.append(i)
+        used += len(chunks[i]["text"])
+    return [(float(meaning[i]), chunks[i]) for i in picked]
+
+
 if __name__ == "__main__":
     data_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "data")
     chunks, vectors = load_library(data_dir)

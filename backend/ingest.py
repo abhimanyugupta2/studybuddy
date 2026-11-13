@@ -118,8 +118,15 @@ def build_chunks(paragraphs):
 
     for par in paragraphs:
         if par["is_heading"]:
-            save_chunk()
-            current, section = [], par["text"]
+            if any(not p.get("bare_heading") for p in current):
+                save_chunk()
+                current = []
+            elif section:
+                # The previous heading had no text of its own (a title right above a section
+                # heading). It used to vanish - and with it "Assignment 3: due November 16".
+                # Keep it as a line of text instead.
+                current.append({"text": section, "page": par["page"], "bare_heading": True})
+            section = par["text"]
             continue
         size = sum(len(p["text"]) for p in current) + len(par["text"])
         if current and size > MAX_CHUNK_CHARS:
@@ -128,6 +135,8 @@ def build_chunks(paragraphs):
             if sum(len(p["text"]) for p in current) + len(par["text"]) > MAX_CHUNK_CHARS:
                 current = []                        # overlap would overflow: start clean
         current.append(par)
+    if section and not any(not p.get("bare_heading") for p in current):
+        current.append({"text": section, "page": paragraphs[-1]["page"], "bare_heading": True})
     save_chunk()
     return drop_title_sections(chunks)
 

@@ -680,6 +680,10 @@ async function ask(session, question) {
     } else if (event.type === "plan") {
       for (const q of event.queries.slice(1, 4)) log("ok", "rephrased:", q);
       if (event.hypothetical) log("ok", "imagined answer:", event.hypothetical.slice(0, 140));
+      log(event.about_documents ? "ok" : "warn", event.about_documents
+        ? (event.overview ? "judged: overview of your documents, reading across all of them"
+                          : "judged: about your documents")
+        : "judged: not about your documents (score check decides)");
       msg.status = "ranking chunks";
       refresh(msg);
     } else if (event.type === "sources") {
@@ -694,7 +698,9 @@ async function ask(session, question) {
       msg.status = "generating answer";
       refresh(msg);
     } else if (event.type === "token") {
-      if (!wrote) { wrote = true; log("info", "streaming answer from llama3.1:8b"); }
+      // with no sources the server sends its fixed "couldn't find" reply; the model isn't asked
+      if (!wrote && msg.sources?.length) log("info", "streaming answer from llama3.1:8b");
+      wrote = true;
       msg.content += event.text;
       refresh(msg);
     }
